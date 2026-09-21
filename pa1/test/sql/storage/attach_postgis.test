@@ -1,0 +1,131 @@
+# name: test/sql/storage/attach_postgis.test
+# description: Test PostGIS integration
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+# This is just to disable the test until we figure out how to get PostGIS in the CI
+require-env HAS_POSTGIS
+
+statement ok
+ATTACH 'dbname=postgres' AS s (TYPE POSTGRES);
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS s.my_points;
+
+statement ok
+DROP TABLE if EXISTS s.t1_copy;
+
+# make sure PostGIS is installed
+statement ok
+SELECT * FROM postgres_query(s, 'SELECT PostGIS_Version()')
+
+# create a table
+statement ok
+CREATE OR REPLACE TABLE s.my_points(geom GEOMETRY);
+
+# insert data
+statement ok
+INSERT INTO s.my_points VALUES ('POINT (1 1)'::GEOMETRY);
+
+# try binary copy
+query I
+SELECT geom FROM s.my_points;
+----
+POINT (1 1)
+
+# text copy
+statement ok
+SET pg_use_binary_copy=false;
+
+statement ok
+INSERT INTO s.my_points VALUES ('POINT (2 2)'::GEOMETRY);
+
+query I
+SELECT geom::VARCHAR FROM s.my_points;
+----
+POINT (1 1)
+POINT (2 2)
+
+query I
+SELECT geom from s.my_points;
+----
+POINT (1 1)
+POINT (2 2)
+
+statement ok
+set pg_use_text_protocol=true;
+
+query I
+SELECT geom from s.my_points;
+----
+POINT (1 1)
+POINT (2 2)
+
+statement ok
+set pg_use_text_protocol=false
+
+# make sure Postgres itself can read the values
+query I
+SELECT * FROM postgres_query(s, 'SELECT ST_AsText(geom) FROM my_points')
+----
+POINT(1 1)
+POINT(2 2)
+
+# re-attach
+statement ok
+DETACH s
+
+statement ok
+ATTACH 'dbname=postgres' AS s (TYPE POSTGRES);
+
+query I
+SELECT geom::VARCHAR FROM s.my_points;
+----
+POINT (1 1)
+POINT (2 2)
+
+# update
+statement ok
+UPDATE s.my_points SET geom='LINESTRING (0 0, 1 1)'::GEOMETRY
+
+query I
+SELECT geom::VARCHAR FROM s.my_points;
+----
+LINESTRING (0 0, 1 1)
+LINESTRING (0 0, 1 1)
+
+# Also test COPY to
+statement ok
+CREATE table t1 (g GEOMETRY);
+
+statement ok
+CREATE table s.t1_copy (g GEOMETRY);
+
+statement ok
+insert into t1 select geom from s.my_points;
+
+query I
+select * from t1;
+----
+LINESTRING (0 0, 1 1)
+LINESTRING (0 0, 1 1)
+
+statement ok
+insert into s.t1_copy select g from t1;
+
+query I
+SELECT * FROM postgres_query(s, 'SELECT ST_AsText(g) FROM t1_copy')
+----
+LINESTRING(0 0,1 1)
+LINESTRING(0 0,1 1)
+
+# Cleanup
+statement ok
+DROP TABLE IF EXISTS s.my_points;
+
+statement ok
+DROP TABLE if EXISTS s.t1_copy;

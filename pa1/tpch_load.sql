@@ -1,0 +1,11 @@
+LOAD 'build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension';
+CALL dbgen(sf=10);
+ATTACH 'host=localhost port=[port] dbname=[dbname]' AS pg (TYPE postgres);
+CREATE TABLE pg.public.region   AS SELECT * FROM region;
+CREATE TABLE pg.public.nation   AS SELECT * FROM nation;
+CREATE TABLE pg.public.supplier AS SELECT * FROM supplier;
+CREATE TABLE pg.public.customer AS SELECT * FROM customer;
+CREATE TABLE pg.public.part     AS SELECT * FROM part;
+CREATE TABLE pg.public.partsupp AS SELECT * FROM partsupp;
+CREATE TABLE pg.public.orders   AS SELECT * FROM orders;
+CREATE TABLE pg.public.lineitem AS SELECT * FROM lineitem;

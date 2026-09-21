@@ -1,0 +1,192 @@
+#include "duckdb.hpp"
+#include "duckdb/main/client_context.hpp"
+
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "postgres_parameters.hpp"
+#include "postgres_scanner.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "storage/postgres_catalog.hpp"
+#include "storage/postgres_transaction.hpp"
+
+namespace duckdb {
+
+static bool ExtractFlag(TableFunctionBindInput &input, const string &name, bool default_val) {
+	auto it = input.named_parameters.find(Identifier(name));
+	if (it != input.named_parameters.end()) {
+		Value &bool_val = it->second;
+		if (!bool_val.IsNull()) {
+			return BooleanValue::Get(bool_val);
+		}
+	}
+	return default_val;
+}
+
+static unique_ptr<FunctionData> BindDML(ClientContext &context, TableFunctionBindInput &input,
+                                        vector<LogicalType> &return_types, vector<Identifier> &names,
+                                        PostgresCatalog &pg_catalog, PostgresConnection &con, std::string sql,
+                                        bool use_transaction) {
+	// The statement returns no result columns: it's a command (DDL, or DML without RETURNING).
+	// Instead of failing, run it as a command and return a single-row Success result. We reuse
+	// the prepare/describe just done — no extra round-trip — and defer execution to
+	// InitGlobalState (execution time, not bind, so EXPLAIN does not run it).
+	auto result = make_uniq<PostgresBindData>(context);
+	result->command_only = true;
+	if (ExtractFlag(input, "suppress_dml_output", false)) {
+		// This invocation wraps a command with no result set (DDL, or DML without RETURNING). Tell the
+		// binder via the return-type modifier so that when this is routed through CONNECT the outer
+		// statement is reported as NOTHING and displays like a native command (no spurious result table).
+		input.table_function.call_return_type = StatementReturnType::NOTHING;
+	}
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back(Identifier("rowcount"));
+	result->SetCatalog(pg_catalog);
+	result->dsn = con.GetDSN();
+	result->types = return_types;
+	result->names.emplace_back(names[0].GetIdentifierName());
+	result->read_only = false;
+	result->sql = std::move(sql);
+	result->use_transaction = use_transaction;
+	PostgresScanFunction::PrepareBind(pg_catalog.GetPostgresVersion(), context, *result, 0);
+	return std::move(result);
+}
+
+static unique_ptr<FunctionData> PGQueryBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<Identifier> &names) {
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw BinderException("Parameters to postgres_query cannot be NULL");
+	}
+
+	// look up the database to query
+	auto db_name = input.inputs[0].GetValue<string>();
+	auto &db_manager = DatabaseManager::Get(context);
+	auto db = db_manager.GetDatabase(context, Identifier(db_name));
+	if (!db) {
+		throw BinderException("Failed to find attached database \"%s\" referenced in postgres_query", db_name);
+	}
+	auto &catalog = db->GetCatalog();
+	if (catalog.GetCatalogType() != "postgres") {
+		throw BinderException("Attached database \"%s\" does not refer to a Postgres database", db_name);
+	}
+	auto &pg_catalog = catalog.Cast<PostgresCatalog>();
+	auto &transaction = Transaction::Get(context, catalog).Cast<PostgresTransaction>();
+	auto sql = input.inputs[1].GetValue<string>();
+	// strip any trailing semicolons
+	StringUtil::RTrim(sql);
+	while (!sql.empty() && sql.back() == ';') {
+		sql = sql.substr(0, sql.size() - 1);
+		StringUtil::RTrim(sql);
+	}
+
+	bool use_transaction = ExtractFlag(input, "use_transaction", true);
+
+	vector<Value> param_values;
+	auto params_it = input.named_parameters.find("params");
+	if (params_it != input.named_parameters.end()) {
+		Value &struct_val = params_it->second;
+		if (struct_val.IsNull()) {
+			throw BinderException("Parameters to postgres_query cannot be NULL");
+		}
+		if (struct_val.type().id() != LogicalTypeId::STRUCT && struct_val.type().id() != LogicalTypeId::TUPLE) {
+			throw BinderException("Query parameters must be specified in a STRUCT");
+		}
+		param_values = StructValue::GetChildren(struct_val);
+	}
+
+	auto &con = use_transaction ? transaction.GetConnection() : transaction.GetConnectionWithoutTransaction();
+
+	if (!ExtractFlag(input, "prepare", true)) {
+		if (param_values.size() > 0) {
+			throw BinderException("query parameters cannot be used with 'prepare=FALSE'");
+		}
+		return BindDML(context, input, return_types, names, pg_catalog, con, std::move(sql), use_transaction);
+	}
+
+	auto conn = con.GetConn();
+	// prepare execution of the query to figure out the result types and names
+	auto prepared = PQprepare(conn, "", sql.c_str(), 0, nullptr);
+	PostgresResult prepared_wrapper(prepared);
+	if (!prepared) {
+		throw BinderException("Failed to prepare query \"%s\" (no result returned): %s", sql, PQerrorMessage(conn));
+	}
+	if (PQresultStatus(prepared) != PGRES_COMMAND_OK) {
+		throw BinderException("Failed to prepare query \"%s\": %s", sql, PQresultErrorMessage(prepared));
+	}
+	// use describe_prepared
+	auto describe_prepared = PQdescribePrepared(conn, "");
+	PostgresResult describe_wrapper(describe_prepared);
+	if (!describe_prepared || PQresultStatus(describe_prepared) != PGRES_COMMAND_OK) {
+		auto extended_err = describe_prepared ? PQresultErrorMessage(describe_prepared) : PQerrorMessage(conn);
+		throw BinderException("Failed to describe prepared statement: %s", extended_err);
+	}
+	int nfields = PQnfields(describe_prepared);
+	if (nfields <= 0) {
+		return BindDML(context, input, return_types, names, pg_catalog, con, std::move(sql), use_transaction);
+	}
+	auto result = make_uniq<PostgresBindData>(context);
+	auto type_config = PostgresTypeConfig::FromContext(context);
+	for (idx_t c = 0; c < nfields; c++) {
+		PostgresType postgres_type;
+		postgres_type.oid = PQftype(describe_prepared, c);
+		PostgresTypeData type_data;
+		type_data.type_name = PostgresUtils::PostgresOidToName(postgres_type.oid);
+		type_data.type_modifier = PQfmod(describe_prepared, c);
+		auto converted_type = PostgresUtils::TypeToLogicalType(nullptr, nullptr, type_config, type_data, postgres_type);
+		result->postgres_types.push_back(postgres_type);
+		return_types.emplace_back(converted_type);
+		names.emplace_back(PQfname(describe_prepared, c));
+	}
+	int nparams = PQnparams(describe_prepared);
+	if (nparams != param_values.size()) {
+		throw BinderException("Incorrect number of parameters specified, expected: %d, actual: %zu, query: \"%s\"",
+		                      nparams, param_values.size(), sql);
+	}
+	vector<Oid> param_types;
+	for (idx_t p = 0; p < nparams; p++) {
+		Oid ptype = PQparamtype(describe_prepared, p);
+		param_types.emplace_back(ptype);
+	}
+
+	// set up the bind data
+	result->type_config = type_config;
+	result->SetCatalog(pg_catalog);
+	result->dsn = con.GetDSN();
+	result->types = return_types;
+	for (auto &nm : names) {
+		result->names.emplace_back(nm.GetIdentifierName());
+	}
+	result->read_only = false;
+	result->sql = std::move(sql);
+	result->params = PostgresParameters(std::move(param_types), std::move(param_values));
+	result->use_transaction = use_transaction;
+	PostgresScanFunction::PrepareBind(pg_catalog.GetPostgresVersion(), context, *result, 0);
+	return std::move(result);
+}
+
+PostgresQueryFunction::PostgresQueryFunction()
+    : TableFunction("postgres_query", {LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, PGQueryBind) {
+	named_parameters["use_transaction"] = LogicalType::BOOLEAN;
+	named_parameters["params"] = LogicalType::ANY;
+	named_parameters["suppress_dml_output"] = LogicalType::BOOLEAN;
+	named_parameters["prepare"] = LogicalType::BOOLEAN;
+	PostgresScanFunction scan_function;
+	init_global = scan_function.init_global;
+	init_local = scan_function.init_local;
+	function = scan_function.function;
+	projection_pushdown = true;
+	global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
+}
+
+PostgresExecuteFunction::PostgresExecuteFunction()
+    : TableFunction("postgres_execute", {LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr, PGQueryBind) {
+	named_parameters["use_transaction"] = LogicalType::BOOLEAN;
+	named_parameters["params"] = LogicalType::ANY;
+	named_parameters["prepare"] = LogicalType::BOOLEAN;
+	PostgresScanFunction scan_function;
+	init_global = scan_function.init_global;
+	init_local = scan_function.init_local;
+	function = scan_function.function;
+	projection_pushdown = true;
+	global_initialization = TableFunctionInitialization::INITIALIZE_ON_SCHEDULE;
+}
+} // namespace duckdb

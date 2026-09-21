@@ -1,0 +1,21 @@
+# name: test/sql/scanner/ssl.test
+# description: Connection with SSL
+# group: [scanner]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner sslmode=require' AS s1 (TYPE POSTGRES)
+
+statement ok
+use s1
+
+query III
+select * from cars;
+----
+ferari	testarosa	red
+aston martin	db2	blue
+bentley	mulsanne	gray
+ford	T	black

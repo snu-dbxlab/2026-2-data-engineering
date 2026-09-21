@@ -1,0 +1,332 @@
+#define DUCKDB_BUILD_LOADABLE_EXTENSION
+#include "duckdb.hpp"
+#include "duckdb/logging/log_manager.hpp"
+#include "duckdb/main/config.hpp"
+#include <openssl/crypto.h>
+#include <openssl/ssl.h>
+
+#include "postgres_scanner.hpp"
+#include "postgres_direct.hpp"
+#include "postgres_storage.hpp"
+#include "postgres_scanner_extension.hpp"
+#include "postgres_binary_copy.hpp"
+#include "postgres_secrets.hpp"
+
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/common/helper.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "storage/postgres_catalog.hpp"
+#include "storage/postgres_connection_pool.hpp"
+#include "storage/postgres_optimizer.hpp"
+#include "duckdb/planner/extension_callback.hpp"
+#include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_context_state.hpp"
+#include "duckdb/main/connection_manager.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "postgres_logging.hpp"
+#include "postgres_hstore.hpp"
+#include "postgres_oauth.hpp"
+
+using namespace duckdb;
+
+class PostgresExtensionState : public ClientContextState {
+public:
+	bool CanRequestRebind() override {
+		return true;
+	}
+	RebindQueryInfo OnPlanningError(ClientContext &context, SQLStatement &statement, ErrorData &error) override {
+		if (error.Type() != ExceptionType::BINDER) {
+			return RebindQueryInfo::DO_NOT_REBIND;
+		}
+		auto &extra_info = error.ExtraInfo();
+		auto entry = extra_info.find("error_subtype");
+		if (entry == extra_info.end()) {
+			return RebindQueryInfo::DO_NOT_REBIND;
+		}
+		if (entry->second != "COLUMN_NOT_FOUND") {
+			return RebindQueryInfo::DO_NOT_REBIND;
+		}
+		// clear caches and rebind
+		PostgresClearCacheFunction::ClearPostgresCaches(context);
+		return RebindQueryInfo::ATTEMPT_TO_REBIND;
+	}
+};
+
+class PostgresExtensionCallback : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		context.registered_state->Insert("postgres_extension", make_shared_ptr<PostgresExtensionState>());
+	}
+};
+
+static void SetPostgresConnectionLimit(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("pg_connection_limit can only be set globally");
+	}
+	auto databases = DatabaseManager::Get(context).GetDatabases(context);
+	for (auto &db_ref : databases) {
+		auto &db = *db_ref;
+		auto &catalog = db.GetCatalog();
+		if (catalog.GetCatalogType() != "postgres") {
+			continue;
+		}
+		catalog.Cast<PostgresCatalog>().GetConnectionPool().SetMaxConnections(UBigIntValue::Get(parameter));
+	}
+	auto &config = DBConfig::GetConfig(context);
+	config.SetOption("pg_connection_limit", parameter);
+
+	// propagate the value also to 'pg_pool_max_connections'
+	optional_ptr<const ConfigurationOption> option;
+	auto setting_index = config.TryGetSettingIndex("pg_pool_max_connections", option);
+	if (setting_index.IsValid()) {
+		context.config.user_settings.SetUserSetting(setting_index.GetIndex(), parameter);
+	}
+}
+
+static void DisablePool(ClientContext &context, SetScope scope, Value &parameter) {
+	if (scope == SetScope::LOCAL) {
+		throw InvalidInputException("pg_connection_cache can only be set globally");
+	}
+	if (parameter.IsNull() || BooleanValue::Get(parameter)) {
+		Value def_size = Value::UBIGINT(dbconnector::pool::ConnectionPoolConfig().max_connections);
+		SetPostgresConnectionLimit(context, scope, def_size);
+		return;
+	}
+	Value zero = Value::UBIGINT(0);
+	SetPostgresConnectionLimit(context, scope, zero);
+}
+
+static void SetPostgresDebugQueryPrint(ClientContext &context, SetScope scope, Value &parameter) {
+	PostgresConnection::DebugSetPrintQueries(BooleanValue::Get(parameter));
+}
+
+void SetPostgresNullByteReplacement(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		return;
+	}
+	for (const auto c : StringValue::Get(parameter)) {
+		if (c == '\0') {
+			throw BinderException("NULL byte replacement string cannot contain NULL values");
+		}
+	}
+}
+
+static std::string CreatePoolNote(const std::string &option) {
+	return std::string() + "This option only applies to newly attached Postgres databases, " +
+	       "to configure a database that is already attached use " +
+	       "\"FROM postgres_configure_pool(catalog_name='my_attached_postgres_db', " + option + ")\"";
+}
+
+static void LoadInternal(ExtensionLoader &loader) {
+	// Prevent a race with OpenSSL init that manifests itself with
+	// the following message on the first connection attempt:
+	// "port 5432 failed: could not create SSL context: unknown option"
+	OPENSSL_init_crypto(0, nullptr);
+	OPENSSL_init_ssl(0, nullptr);
+
+	// Register the OAuth bearer token hook before any connections are made
+	PostgresInitOAuthHook();
+
+	PostgresScanFunction postgres_fun;
+	loader.RegisterFunction(postgres_fun);
+
+	PostgresScanFunctionFilterPushdown postgres_fun_filter_pushdown;
+	loader.RegisterFunction(postgres_fun_filter_pushdown);
+
+	PostgresDirectScanFunction postgres_direct_scan;
+	loader.RegisterFunction(postgres_direct_scan);
+
+	PostgresAttachFunction attach_func;
+	loader.RegisterFunction(attach_func);
+
+	PostgresClearCacheFunction clear_cache_func;
+	loader.RegisterFunction(clear_cache_func);
+
+	PostgresQueryFunction query_func;
+	loader.RegisterFunction(query_func);
+
+	PostgresExecuteFunction execute_func;
+	loader.RegisterFunction(execute_func);
+
+	PostgresBinaryCopyFunction binary_copy;
+	loader.RegisterFunction(binary_copy);
+
+	PostgresReadBinaryFunction read_binary_func;
+	loader.RegisterFunction(read_binary_func);
+
+	PostgresConfigurePoolFunction configure_pool_function;
+	loader.RegisterFunction(configure_pool_function);
+
+	RegisterHstoreFunctions(loader);
+
+	// Register the new type
+	loader.RegisterSecretType(PostgresSecrets::CreateType());
+	loader.RegisterSecretType(PostgresSecrets::CreateRdsType());
+
+	CreateSecretFunction postgres_secret_function = {"postgres", "config", PostgresSecrets::CreateFunction};
+	PostgresSecrets::SetSecretParameters(postgres_secret_function);
+	loader.RegisterFunction(postgres_secret_function);
+
+	dbconnector::pool::ConnectionPoolConfig default_pool_config;
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	StorageExtension::Register(config, "postgres_scanner", make_shared_ptr<PostgresStorageExtension>());
+
+	config.AddExtensionOption("pg_use_binary_copy", "Whether or not to use BINARY copy to read data",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("pg_use_ctid_scan", "Whether or not to parallelize scanning using table ctids",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("pg_pages_per_task", "The amount of pages per task", LogicalType::UBIGINT,
+	                          Value::UBIGINT(PostgresBindData::DEFAULT_PAGES_PER_TASK));
+	config.AddExtensionOption(
+	    "pg_connection_limit",
+	    "The maximum amount of concurrent Postgres connections."
+	    " This option is deprecated, instead use \"SET pg_pool_max_connections = 42\" for newly attached Postgres "
+	    "databases and \"FROM postgres_configure_pool(catalog_name='my_attached_postgres_db', max_connections=42)\" "
+	    "for "
+	    "already attached Postgres databases.",
+	    LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), SetPostgresConnectionLimit);
+	config.AddExtensionOption(
+	    "pg_array_as_varchar", "Read Postgres arrays as varchar - enables reading mixed dimensional arrays",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), PostgresClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption(
+	    "pg_numeric_as_varchar",
+	    "Read Postgres numerics without precision and scale or precision > 38 as varchar instead of double",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), PostgresClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption(
+	    "pg_numeric_nan_as_null", "Read Postgres numeric NaN value as NULL instead of throwing an error",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), PostgresClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption(
+	    "pg_connection_cache",
+	    "Whether or not to use the connection pooling."
+	    " This option is deprecated, instead to disable the connection pooling use \"SET pg_pool_max_connections=0\" "
+	    "for newly attached Postgres databases and \"FROM "
+	    "postgres_configure_pool(catalog_name='my_attached_postgres_db', "
+	    "max_connections=0)\" for already attached Postgres databases.",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), DisablePool);
+	config.AddExtensionOption("pg_experimental_filter_pushdown", "Whether or not to use filter pushdown",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("pg_direct_read",
+	                          "Read attached tables from the PostgreSQL heap files directly instead of COPY (requires "
+	                          "frozen data and read access to the data directory)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption("pg_order_pushdown", "Push ORDER BY and LIMIT clauses to Postgres (default: true)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+	config.AddExtensionOption("pg_null_byte_replacement",
+	                          "When writing NULL bytes to Postgres, replace them with the given character",
+	                          LogicalType::VARCHAR, Value(), SetPostgresNullByteReplacement);
+	config.AddExtensionOption("pg_debug_show_queries", "DEBUG SETTING: print all queries sent to Postgres to stdout",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false), SetPostgresDebugQueryPrint);
+	config.AddExtensionOption("pg_oauth_token",
+	                          "OAuth bearer token for PostgreSQL OAUTHBEARER authentication. "
+	                          "Takes priority over the PGOAUTHTOKEN environment variable",
+	                          LogicalType::VARCHAR, Value(), nullptr, SetScope::SESSION);
+	config.AddExtensionOption("pg_use_text_protocol",
+	                          "Whether or not to use TEXT protocol to read data. This is slower, but provides better "
+	                          "compatibility with non-Postgres systems",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	config.AddExtensionOption(
+	    "pg_use_information_schema_introspection",
+	    "Use SQL-standard information_schema views for ATTACH-time schema discovery instead of pg_catalog."
+	    "For compatibility with pg protocol compatible databases like spanner, cockroach, redshift, ...",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), PostgresClearCacheFunction::ClearCacheOnSetting);
+	config.AddExtensionOption(
+	    "pg_staleness_query_enabled",
+	    "Whether or not the table catalog cache checks Postgres for external DDL changes before serving a "
+	    "cache hit. Defaults to the opposite of pg_use_information_schema_introspection when not explicitly set "
+	    "(off for pg protocol compatible databases that may not support the underlying query, on for Postgres).",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(false), PostgresClearCacheFunction::ClearCacheOnSetting, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "pg_staleness_query",
+	    "Custom query used in place of the default table staleness query when pg_staleness_query_enabled "
+	    "resolves to true. Must contain a ${SCHEMA} placeholder and return at least 3 columns "
+	    "(identity, name, revision marker). Empty (default) uses the built-in pg_class/xmin query.",
+	    LogicalType::VARCHAR, Value(), PostgresClearCacheFunction::ClearCacheOnSetting, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_statement_timeout_millis",
+	                          "Postgres statement timeout in milliseconds to set on scan connections",
+	                          LogicalType::UINTEGER, Value());
+	config.AddExtensionOption("pg_idle_in_transaction_timeout_millis",
+	                          "Postgres idle in transaction timeout in milliseconds to set on scan connections",
+	                          LogicalType::UINTEGER, Value());
+	// connection pool options
+	config.AddExtensionOption(
+	    "pg_pool_acquire_mode",
+	    "How to acquire connections from the pool: 'force' (always connect, ignore pool limit), "
+	    "'wait' (block until available), 'try' (fail immediately if unavailable) (default: force)",
+	    LogicalType::VARCHAR, Value(dbconnector::pool::AcquireModeHelpers::ToString(default_pool_config.acquire_mode)),
+	    PostgresConnectionPool::ValidatePoolAcquireMode, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_max_connections",
+	                          "Maximum number of connections that are allowed to be cached in a connection pool for "
+	                          "each attached Postgres database. "
+	                          "This number can be temporary exceeded when parallel scans are used. " +
+	                              CreatePoolNote("max_connections=42"),
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_connections), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_wait_timeout_millis",
+	                          "Maximum number of milliseconds to wait when acquiring a connection from a pool where "
+	                          "all available connections are already taken. " +
+	                              CreatePoolNote("wait_timeout_millis=60000"),
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.wait_timeout_millis), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "pg_pool_enable_thread_local_cache",
+	    "Whether to enable the connection caching in thread-local cache. Such connections are getting pinned to the "
+	    "threads and are not made available to other threads, while still taking the place in the pool. " +
+	        CreatePoolNote("enable_thread_local_cache=FALSE"),
+	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.tl_cache_enabled), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_max_lifetime_millis",
+	                          "Maximum number of milliseconds the connection can be kept open. This number is checked "
+	                          "when the connection is taken from the pool and returned to the pool. "
+	                          "When the connection pool reaper thread is enabled ('pg_pool_enable_reaper_thread' "
+	                          "option), then this number is checked in background periodically. " +
+	                              CreatePoolNote("max_lifetime_millis=600000"),
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.max_lifetime_millis), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_idle_timeout_millis",
+	                          "Maximum number of milliseconds the connection can be kept idle in the pool. This number "
+	                          "is checked when the connection is taken from the pool. "
+	                          "When the connection pool reaper thread is enabled ('pg_pool_enable_reaper_thread' "
+	                          "option), then this number is checked in background periodically. " +
+	                              CreatePoolNote("idle_timeout_millis=300000"),
+	                          LogicalType::UBIGINT, Value::UBIGINT(default_pool_config.idle_timeout_millis), nullptr,
+	                          SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "pg_pool_enable_reaper_thread",
+	    "Whether to enable the connection pool reaper thread, that periodically scans the pool to check the "
+	    "'max_lifetime_millis' and 'idle_timeout_millis' and closes the connection which exceed the specified values. "
+	    "Either 'max_lifetime_millis' or 'idle_timeout_millis' must be set to a non-zero value for this option to be "
+	    "effective. " +
+	        CreatePoolNote("enable_reaper_thread=TRUE"),
+	    LogicalType::BOOLEAN, Value::BOOLEAN(default_pool_config.start_reaper_thread), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption("pg_pool_health_check_query",
+	                          "The query that is used to check that the connection is healthy. Setting this option to "
+	                          "an empty string disables the health check. " +
+	                              CreatePoolNote("health_check_query=SELECT 42"),
+	                          LogicalType::VARCHAR, default_pool_config.health_check_query, nullptr, SetScope::GLOBAL);
+
+	OptimizerExtension postgres_optimizer;
+	postgres_optimizer.optimize_function = PostgresOptimizer::Optimize;
+	OptimizerExtension::Register(config, std::move(postgres_optimizer));
+
+	ExtensionCallback::Register(config, make_shared_ptr<PostgresExtensionCallback>());
+	for (auto &connection : ConnectionManager::Get(loader.GetDatabaseInstance()).GetConnectionList()) {
+		connection->registered_state->Insert("postgres_extension", make_shared_ptr<PostgresExtensionState>());
+	}
+
+	auto &instance = loader.GetDatabaseInstance();
+	auto &log_manager = instance.GetLogManager();
+	log_manager.RegisterLogType(make_uniq<PostgresQueryLogType>());
+}
+
+void PostgresScannerExtension::Load(ExtensionLoader &loader) {
+	LoadInternal(loader);
+}
+
+extern "C" {
+
+DUCKDB_CPP_EXTENSION_ENTRY(postgres_scanner, loader) {
+	LoadInternal(loader);
+}
+}

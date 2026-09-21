@@ -1,0 +1,41 @@
+# name: test/sql/storage/attach_isolation_level.test
+# description: Test attaching with a different isolation level
+# group: [storage]
+
+require postgres_scanner
+
+require-env POSTGRES_TEST_DATABASE_AVAILABLE
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, ISOLATION_LEVEL 'READ COMMITTED')
+
+# select from a NUMERIC field
+query I
+SELECT * FROM s.pg_giant_numeric
+----
+0.0
+1.0000000000000002e+32
+-1.234567891234568e+26
+
+statement ok
+DETACH s
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, ISOLATION_LEVEL 'SERIALIZABLE')
+
+# select from a NUMERIC field
+query I
+SELECT * FROM s.pg_giant_numeric
+----
+0.0
+1.0000000000000002e+32
+-1.234567891234568e+26
+
+statement ok
+DETACH s
+
+# unrecognized isolation level
+statement error
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES, ISOLATION_LEVEL 'unrecognized_isolation')
+----
+unrecognized_isolation

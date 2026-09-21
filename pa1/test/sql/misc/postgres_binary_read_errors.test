@@ -1,0 +1,32 @@
+# name: test/sql/misc/postgres_binary_read_errors.test
+# description: Test error handling for reading postgres binary format files
+# group: [misc]
+
+require postgres_scanner
+
+statement ok
+ATTACH 'dbname=postgresscanner' AS s (TYPE POSTGRES)
+
+statement ok
+DETACH s
+
+# --- Non-existent file ---
+statement error
+SELECT * FROM read_postgres_binary('{TEST_DIR}/nonexistent.bin', columns={i: 'INTEGER'});
+----
+IO Error:
+
+# --- Invalid file (not postgres binary format) ---
+statement ok
+COPY (SELECT 42) TO '{TEST_DIR}/not_binary.csv' (FORMAT CSV);
+
+statement error
+SELECT * FROM read_postgres_binary('{TEST_DIR}/not_binary.csv', columns={i: 'INTEGER'});
+----
+invalid header
+
+# --- Missing columns parameter ---
+statement error
+SELECT * FROM read_postgres_binary('{TEST_DIR}/not_binary.csv');
+----
+read_postgres_binary requires a 'columns' parameter

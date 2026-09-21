@@ -1,0 +1,24 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 9dd2ea45d2..a583df2d9a 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -132,7 +132,6 @@ if(WIN32 AND NOT MINGW)
+   set(CMAKE_RC_FLAGS
+       "${CMAKE_RC_FLAGS} -D DUCKDB_DEV_ITERATION=\"${RC_DEV_ITERATION}\"")
+ 
+-  target_sources(duckdb PRIVATE version.rc)
+ endif()
+ 
+ install(
+diff --git a/tools/shell/CMakeLists.txt b/tools/shell/CMakeLists.txt
+index 7c376be703..956a2df514 100644
+--- a/tools/shell/CMakeLists.txt
++++ b/tools/shell/CMakeLists.txt
+@@ -74,7 +74,6 @@ if(WIN32 AND NOT MINGW)
+       "${CMAKE_RC_FLAGS} -D DUCKDB_DEV_ITERATION=\"${RC_DEV_ITERATION}\"")
+   set(CMAKE_RC_FLAGS
+       "${CMAKE_RC_FLAGS} -D DUCKDB_COPYRIGHT_YEAR=\"${DUCKDB_COPYRIGHT_YEAR}\"")
+-  target_sources(shell PRIVATE rc/duckdb.rc)
+   # Opt into the Windows Segment Heap to avoid the default NT heap's lock
+   # contention under multi-threaded allocation (see #24027). CMake merges
+   # .manifest sources into the linker manifest via mt.exe.
