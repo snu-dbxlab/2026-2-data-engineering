@@ -31,12 +31,22 @@ SRC = os.environ.get("PA2_SRC", os.path.join(ROOT, "src"))
 
 BUILD = {cfg: os.path.join(ROOT, "build-" + cfg) for cfg in ("default", "snudbx")}
 INST = {cfg: os.path.join(ROOT, "inst-" + cfg) for cfg in ("default", "snudbx")}
-PGDATA = os.path.join(ROOT, "pgdata")
+# The cluster and server logs live in RUNDIR, which the server's OS user owns.
+RUNDIR = os.path.join(ROOT, "run")
+PGDATA = os.path.join(RUNDIR, "pgdata")
+
+# initdb, pg_ctl and postgres refuse to run as root, and Gradescope runs the
+# autograder as root.  There the server side runs as an unprivileged user.
+IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+SERVER_USER = os.environ.get("PA2_SERVER_USER", "pa2server")
 
 JOBS = str(min(os.cpu_count() or 4, 16))
 
 CONFIGURE_COMMON = [
     "--enable-cassert", "--enable-debug",
+    # Track header dependencies: the local runner reuses build directories,
+    # and PA2 edits headers, so without this stale objects would be linked.
+    "--enable-depend",
     "--without-icu", "--without-zlib", "--without-readline",
 ]
 
@@ -126,6 +136,24 @@ def compiler_diagnostics(cfg):
 
 # --- cluster ---------------------------------------------------------------
 
+def _as_server(cmd):
+    """Run a server-side command as SERVER_USER when we are root."""
+    return ["runuser", "-u", SERVER_USER, "--"] + cmd if IS_ROOT else cmd
+
+
+def _prepare_rundir():
+    os.makedirs(RUNDIR, exist_ok=True)
+    if IS_ROOT:
+        if subprocess.run(["id", "-u", SERVER_USER], capture_output=True).returncode != 0:
+            subprocess.run(["useradd", "--system", "--no-create-home", SERVER_USER], check=True)
+        shutil.chown(RUNDIR, SERVER_USER, SERVER_USER)
+        # The server user must be able to reach RUNDIR and the installs.
+        d = RUNDIR
+        while d not in ("/", ""):
+            d = os.path.dirname(d)
+            os.chmod(d, os.stat(d).st_mode | 0o011)
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -149,9 +177,10 @@ def initdb():
     if os.path.exists(os.path.join(PGDATA, "PG_VERSION")):
         return
     build("default")
+    _prepare_rundir()
     shutil.rmtree(PGDATA, ignore_errors=True)
-    r = _run([os.path.join(INST["default"], "bin", "initdb"),
-              "-D", PGDATA, "-U", "postgres", "--no-sync"])
+    r = _run(_as_server([os.path.join(INST["default"], "bin", "initdb"),
+                         "-D", PGDATA, "-U", "postgres", "--no-sync"]))
     if r.returncode != 0:
         raise BuildError("initdb failed:\n%s" % _tail(r.stdout))
 
@@ -163,7 +192,7 @@ class Server:
         self.cfg = cfg
         self.settings = settings or {}
         self.expect_start = expect_start
-        self.log = os.path.join(ROOT, "pg-%s.log" % cfg)
+        self.log = os.path.join(RUNDIR, "pg-%s.log" % cfg)
         self.started = False
 
     def __enter__(self):
@@ -178,8 +207,9 @@ class Server:
             opts += ["-c", "%s=%s" % (k, v)]
         if os.path.exists(self.log):
             os.remove(self.log)
-        r = _run([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
-                  "-D", PGDATA, "-l", self.log, "-o", " ".join(opts), "-w", "start"],
+        r = _run(_as_server([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
+                             "-D", PGDATA, "-l", self.log, "-o", " ".join(opts),
+                             "-w", "start"]),
                  timeout=120)
         self.started = (r.returncode == 0)
         if self.expect_start and not self.started:
@@ -188,8 +218,8 @@ class Server:
 
     def __exit__(self, *exc):
         if self.started:
-            _run([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
-                  "-D", PGDATA, "stop", "-m", "fast"], timeout=120)
+            _run(_as_server([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
+                             "-D", PGDATA, "stop", "-m", "fast"]), timeout=120)
             self.started = False
         return False
 
@@ -236,8 +266,12 @@ class Server:
     def regress(self):
         """installcheck-parallel against this server; returns (ok, tail of output)."""
         env = dict(os.environ, PGPORT=str(port()), PGUSER="postgres")
-        r = _run(["make", "-C", os.path.join(BUILD[self.cfg], "src", "test", "regress"),
-                  "installcheck-parallel"], env=env, timeout=1800)
+        rdir = os.path.join(BUILD[self.cfg], "src", "test", "regress")
+        if IS_ROOT:
+            # Some tests make the server write into rdir/results (COPY TO).
+            subprocess.run(["chown", "-R", SERVER_USER, rdir], check=True)
+        r = _run(_as_server(["make", "-C", rdir, "installcheck-parallel"]),
+                 env=env, timeout=1800)
         return (r.returncode == 0, _tail(r.stdout, 30))
 
     def rows(self, query, db="postgres"):
