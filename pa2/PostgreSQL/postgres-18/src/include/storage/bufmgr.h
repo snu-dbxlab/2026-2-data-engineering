@@ -152,6 +152,11 @@ struct SMgrRelationData;
 /* in globals.c ... this duplicates miscadmin.h */
 extern PGDLLIMPORT int NBuffers;
 
+#ifdef SNUDBX
+/* Upper bound of the buffer_pools setting.  Also defined in lwlock.h. */
+#define MAX_BUFFER_POOLS 8
+#endif
+
 /* in bufmgr.c */
 extern PGDLLIMPORT bool zero_damaged_pages;
 extern PGDLLIMPORT int bgwriter_lru_maxpages;

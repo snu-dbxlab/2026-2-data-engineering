@@ -326,6 +326,28 @@ extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 extern PGDLLIMPORT ConditionVariableMinimallyPadded *BufferIOCVArray;
 extern PGDLLIMPORT WritebackContext BackendWritebackContext;
 
+#ifdef SNUDBX
+/* State of one buffer pool. */
+typedef enum PoolState
+{
+	POOLSTATE_READY,			/* empty, available to become active */
+	POOLSTATE_ACTIVE,			/* new pages are placed here */
+} PoolState;
+
+/* Per-pool descriptor; one per pool, held in BufferPoolControl. */
+typedef struct BufferPoolDesc
+{
+	pg_atomic_uint32 state;		/* a PoolState */
+	pg_atomic_uint32 next_free_slot;	/* first slot never handed out */
+} BufferPoolDesc;
+
+/* Buffer pool control block, in shared memory ("Buffer Pool Control"). */
+typedef struct BufferPoolControl
+{
+	/* your member variables */
+} BufferPoolControl;
+#endif
+
 /* in localbuf.c */
 extern PGDLLIMPORT BufferDesc *LocalBufferDescriptors;
 

@@ -1,0 +1,7 @@
+# Created by students under $PGBASE (= pa2/PostgreSQL); never committed.
+/PostgreSQL/build-*/
+/PostgreSQL/pgsql/
+/PostgreSQL/pgsql-default/
+/PostgreSQL/pgdata/
+/PostgreSQL/*.patch
+__pycache__/
