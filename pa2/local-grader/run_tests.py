@@ -16,9 +16,24 @@ from gradescope_utils.autograder_utils.json_test_runner import JSONTestRunner
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Test number prefix -> step shown to students.
-STEPS = [("1.", "Step 1-1"), ("2.", "Step 1-2"), ("3.", "Step 1-3")]
+import harness
+
+# Test number prefix -> step shown to students.  A test belongs to the first
+# prefix it matches, so the extra ("4.E") is kept apart from step 2-1.
+STEPS = [("1.", "Step 1-1"), ("2.", "Step 1-2"), ("3.", "Step 1-3"),
+         ("4.E", "Step 2-1 extra"), ("4.", "Step 2-1"),
+         ("5.", "Step 2-2"), ("6.", "Step 2-3")]
+# Display order of the per-step lines.
+LABELS = ["Step 1-1", "Step 1-2", "Step 1-3", "Step 2-1", "Step 2-2",
+          "Step 2-3", "Step 2-1 extra"]
 BUILD_GATE = ("0.1", "0.2")
+
+
+def step_of(number):
+    for prefix, label in STEPS:
+        if str(number).startswith(prefix):
+            return label
+    return None
 
 
 def summarize(data):
@@ -31,9 +46,17 @@ def summarize(data):
                         "status": "failed", "visibility": "visible",
                         "output": "Your tree does not build (default or snudbx "
                                   "configuration).  Every step scores 0."})
+    if harness._grader_error[0]:
+        # The instructor probes include the headers and call the names the spec
+        # fixes; if those differ, every probe-based test fails for one reason.
+        summary.append({"name": "Instructor checks", "score": 0.0, "max_score": 0.0,
+                        "status": "failed", "visibility": "visible",
+                        "output": "The instructor's check module does not compile "
+                                  "against your headers: a name or signature that "
+                                  "the spec fixes is missing or different."})
     total = 0.0
-    for prefix, label in STEPS:
-        mine = [t for t in tests if str(t.get("number", "")).startswith(prefix)]
+    for label in LABELS:
+        mine = [t for t in tests if step_of(t.get("number", "")) == label]
         if not mine:
             continue
         mx = sum(t.get("max_score", 0.0) for t in mine)

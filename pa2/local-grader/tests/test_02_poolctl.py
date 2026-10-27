@@ -38,7 +38,10 @@ class TestPoolControl(unittest.TestCase):
                 "SELECT p.proname, p.pronargs, p.prorettype::regtype "
                 "FROM pg_proc p JOIN pg_depend d ON d.objid = p.oid "
                 "JOIN pg_extension e ON e.oid = d.refobjid "
-                "WHERE e.extname = 'snudbx' AND d.deptype = 'e' ORDER BY 1")
+                "WHERE e.extname = 'snudbx' AND d.deptype = 'e' "
+                # Later steps add functions; only these three are step 1-2's.
+                "AND p.proname IN ('snudbx_active_pool', 'snudbx_generation', "
+                "'snudbx_pool_count') ORDER BY 1")
             self.assertEqual(sigs, [["snudbx_active_pool", "0", "integer"],
                                     ["snudbx_generation", "0", "bigint"],
                                     ["snudbx_pool_count", "0", "integer"]])
