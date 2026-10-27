@@ -5,3 +5,6 @@
 /PostgreSQL/pgdata/
 /PostgreSQL/*.patch
 __pycache__/
+# Step 2-4 outputs
+/workloads/*.csv
+/workloads/*.png

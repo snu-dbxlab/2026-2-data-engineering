@@ -185,6 +185,48 @@ def initdb():
         raise BuildError("initdb failed:\n%s" % _tail(r.stdout))
 
 
+def _postmaster_pid():
+    try:
+        with open(os.path.join(PGDATA, "postmaster.pid")) as f:
+            return int(f.readline())
+    except (OSError, ValueError):
+        return None
+
+
+def stop_server(cfg):
+    """Stop whatever postmaster runs on PGDATA.  A submission that crashes the
+    server can leave a postmaster that a fast shutdown does not stop; it must
+    not keep every later test from starting a server."""
+    pg_ctl = os.path.join(INST[cfg], "bin", "pg_ctl")
+    for mode in ("fast", "immediate"):
+        if _postmaster_pid() is None:
+            return
+        try:
+            _run(_as_server([pg_ctl, "-D", PGDATA, "stop", "-m", mode]), timeout=60)
+        except subprocess.TimeoutExpired:
+            pass
+    pid = _postmaster_pid()
+    if pid is not None:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+        time.sleep(1)
+        try:
+            os.remove(os.path.join(PGDATA, "postmaster.pid"))
+        except OSError:
+            pass
+
+
+# Regression tests that fail with the settings above on stock PostgreSQL too
+# (plans differ without autovacuum, no parallel workers), plus stats: from
+# Step 2-3 on, data pools use no ring, so VACUUM reuses no ring buffer.
+REGRESS_KNOWN_FAILURES = {
+    "uuid", "rangetypes", "box", "inet", "geometry", "groupingsets",
+    "select_parallel", "cluster", "returning", "with", "stats",
+}
+
+
 class Server:
     """Context manager: a running postmaster from one configuration."""
 
@@ -201,10 +243,17 @@ class Server:
         opts = ["-p", str(port())]
         # Assumption A3 (PA2_ASSUMPTIONS.md): every server runs with synchronous
         # I/O.  PostgreSQL 18 defaults to io_method=worker.
-        settings = {"io_method": "sync"}
+        # Assumption A1: one backend does all the work, so no parallel query
+        # workers and no autovacuum workers.
+        settings = {"io_method": "sync",
+                    "max_parallel_workers": "0",
+                    "max_parallel_maintenance_workers": "0",
+                    "autovacuum": "off"}
         settings.update(self.settings)
         for k, v in settings.items():
             opts += ["-c", "%s=%s" % (k, v)]
+        if _postmaster_pid() is not None:        # left over from a crash
+            stop_server(self.cfg)
         if os.path.exists(self.log):
             os.remove(self.log)
         r = _run(_as_server([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
@@ -218,8 +267,7 @@ class Server:
 
     def __exit__(self, *exc):
         if self.started:
-            _run(_as_server([os.path.join(INST[self.cfg], "bin", "pg_ctl"),
-                             "-D", PGDATA, "stop", "-m", "fast"]), timeout=120)
+            stop_server(self.cfg)
             self.started = False
         return False
 
@@ -246,6 +294,24 @@ class Server:
                   "-v", "ON_ERROR_STOP=1", "-Atc", query], timeout=300)
         return (r.returncode == 0, r.stdout.strip())
 
+    def session(self, queries, db="postgres"):
+        """Run queries in order in one session; return (ok, outputs).
+
+        outputs holds one stripped output per query that ran; it stops at
+        the first error, whose message is the last element.
+        """
+        mark = "@@pa2-next@@"
+        cmd = [os.path.join(INST[self.cfg], "bin", "psql"),
+               "-p", str(port()), "-U", "postgres", "-d", db, "-q",
+               "-v", "ON_ERROR_STOP=1", "-At"]
+        for q in queries:
+            cmd += ["-c", q, "-c", "\\echo " + mark]
+        r = _run(cmd, timeout=600)
+        parts = [x.strip() for x in r.stdout.split(mark + "\n")]
+        if parts and parts[-1] == "":
+            parts.pop()
+        return (r.returncode == 0, parts)
+
     def create_extension(self, db="postgres"):
         """CREATE EXTENSION snudbx, with a build failure reported as the cause."""
         if _ext_error[0]:
@@ -264,15 +330,25 @@ class Server:
         self.sql("CREATE EXTENSION IF NOT EXISTS snudbx_grader", db)
 
     def regress(self):
-        """installcheck-parallel against this server; returns (ok, tail of output)."""
+        """installcheck against this server; returns (ok, tail of output).
+
+        The tests run one at a time (A1).  ok means every failing test is in
+        REGRESS_KNOWN_FAILURES.
+        """
         env = dict(os.environ, PGPORT=str(port()), PGUSER="postgres")
         rdir = os.path.join(BUILD[self.cfg], "src", "test", "regress")
         if IS_ROOT:
             # Some tests make the server write into rdir/results (COPY TO).
             subprocess.run(["chown", "-R", SERVER_USER, rdir], check=True)
-        r = _run(_as_server(["make", "-C", rdir, "installcheck-parallel"]),
-                 env=env, timeout=1800)
-        return (r.returncode == 0, _tail(r.stdout, 30))
+        r = _run(_as_server(["make", "-C", rdir, "installcheck"]),
+                 env=env, timeout=2400)
+        failed = set(re.findall(r"^not ok\s+\d+\s+[+-]?\s*(\S+)", r.stdout, re.M))
+        unexpected = sorted(failed - REGRESS_KNOWN_FAILURES)
+        ok = "1.." in r.stdout and not unexpected
+        out = _tail(r.stdout, 30)
+        if unexpected:
+            out = "unexpected failures: %s\n%s" % (", ".join(unexpected), out)
+        return (ok, out)
 
     def rows(self, query, db="postgres"):
         out = self.sql(query, db)
