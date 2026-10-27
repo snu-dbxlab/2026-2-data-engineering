@@ -224,6 +224,10 @@ def stop_server(cfg):
 REGRESS_KNOWN_FAILURES = {
     "uuid", "rangetypes", "box", "inet", "geometry", "groupingsets",
     "select_parallel", "cluster", "returning", "with", "stats",
+    # These use materialized views, which lose their contents unless the
+    # Step 2-1 extra is solved.  The extra is checked by 4.E1 only, so
+    # skipping it must not cost the regression points.
+    "copy", "create_am", "matview", "tablespace",
 }
 
 

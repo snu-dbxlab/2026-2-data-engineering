@@ -27,6 +27,12 @@ STEPS = [("1.", "Step 1-1"), ("2.", "Step 1-2"), ("3.", "Step 1-3"),
 LABELS = ["Step 1-1", "Step 1-2", "Step 1-3", "Step 2-1", "Step 2-2",
           "Step 2-3", "Step 2-1 extra"]
 BUILD_GATE = ("0.1", "0.2")
+# Scored 0 here: the extra's points are given in manual grading, together
+# with the NOTES.md explanation.  The line only says whether it passed.
+PASS_FAIL = {"Step 2-1 extra":
+             ("Passed. The extra points are given in manual grading, together "
+              "with your explanation in NOTES.md.",
+              "Not passed.")}
 
 
 def step_of(number):
@@ -62,8 +68,14 @@ def summarize(data):
         mx = sum(t.get("max_score", 0.0) for t in mine)
         got = 0.0 if build_failed else sum(t.get("score", 0.0) for t in mine)
         total += got
-        summary.append({"name": label, "score": got, "max_score": mx,
-                        "visibility": "visible"})
+        line = {"name": label, "score": got, "max_score": mx,
+                "visibility": "visible"}
+        if label in PASS_FAIL:
+            passed = not build_failed and all(t.get("status") == "passed"
+                                              for t in mine)
+            line["status"] = "passed" if passed else "failed"
+            line["output"] = PASS_FAIL[label][0 if passed else 1]
+        summary.append(line)
     for t in tests:
         t["visibility"] = "hidden"
     data["tests"] = summary + tests
