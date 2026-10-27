@@ -27,7 +27,7 @@ EXPECTED = "300000|45000150000|24000000|100000"
 
 class TestSealLocal(unittest.TestCase):
 
-    @weight(3)
+    @weight(5)
     @number("6.1")
     def test_big_table(self):
         """A table larger than one pool survives updates and a restart (buffer_pools = 3, 4)"""
