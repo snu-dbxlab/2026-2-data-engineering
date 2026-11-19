@@ -1,0 +1,5 @@
+# pa3/PostgreSQL is a symlink to ../pa2/PostgreSQL; its builds and data are ignored by pa2/.gitignore.
+__pycache__/
+# Step 3-5 outputs
+/workloads/*.csv
+/workloads/*.png
